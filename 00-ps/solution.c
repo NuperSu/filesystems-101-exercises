@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include <solution.h>
 
@@ -48,6 +49,11 @@ static char *read_exe_path(pid_t pid) {
 		if ((size_t)n < cap - 1) {
 			buf[n] = '\0';
 			break;
+		}
+		if (cap > SIZE_MAX / 2) {
+			free(path);
+			free(buf);
+			return NULL;
 		}
 		cap *= 2;
 		char *nbuf = (char *)realloc(buf, cap);
