@@ -41,6 +41,10 @@ static char *readlink_to_string(const char *path) {
 			buf[n] = '\0';
 			return buf;
 		}
+		if (cap > SIZE_MAX / 2) { 
+			free(buf);
+			return NULL;
+		}
 		cap *= 2;
 		char *nbuf = (char *)realloc(buf, cap);
 		if (!nbuf) { free(buf); return NULL; }
@@ -78,8 +82,13 @@ void lsof(void)
 			size_t need = strlen(fd_dir_path) + 1 + strlen(file_entry->d_name) + 1;
 			char *fd_path = (char *)malloc(need);
 			if (!fd_path) continue;
-			snprintf(fd_path, need, "%s/%s", fd_dir_path, file_entry->d_name);
-
+			
+			int n = snprintf(fd_path, need, "%s/%s", fd_dir_path, file_entry->d_name);
+			if (n < 0 || (size_t)n >= need) {
+				free(fd_path);
+				continue;
+			}
+			
 			char *target = readlink_to_string(fd_path);
 			if (target) {
 				report_file(target);
