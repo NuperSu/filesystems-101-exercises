@@ -18,11 +18,12 @@ static int is_number(const char *s) {
 static char *construct_path(pid_t pid, const char *suffix) {
 	char buf[64];
 	int n = snprintf(buf, sizeof(buf), "/proc/%ld/", (long)pid);
+	if (n < 0 || (size_t)n >= sizeof(buf)) return NULL;
 	size_t need = (size_t)n + strlen(suffix) + 1;
 	char *out = (char *)malloc(need);
 	if (!out) return NULL;
 	memcpy(out, buf, (size_t)n);
-	strcpy(out + n, suffix);
+	memcpy(out + n, suffix, strlen(suffix) + 1);
 	return out;
 }
 
