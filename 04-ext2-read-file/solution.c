@@ -104,20 +104,26 @@ struct ext2_inode_disk
 
 static int read_exact_at(int fd, void *buf, size_t count, off_t offset)
 {
-    if (lseek(fd, offset, SEEK_SET) < 0)
-        return -errno;
-
     uint8_t *p = (uint8_t *)buf;
     size_t remaining = count;
 
     while (remaining > 0) {
-        ssize_t r = read(fd, p, remaining);
-        if (r < 0)
+        size_t chunk = remaining;
+        if (chunk > (size_t)SSIZE_MAX)
+            chunk = (size_t)SSIZE_MAX;
+
+        ssize_t r = pread(fd, p, chunk, offset);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
             return -errno;
+        }
         if (r == 0)
             return -EIO; /* unexpected EOF */
-        p += (size_t)r;
+
+        p        += (size_t)r;
         remaining -= (size_t)r;
+        offset   += (off_t)r;
     }
 
     return 0;
@@ -148,10 +154,24 @@ static int ext2_read_basic_sb(int img,
 
     int block_size = (int)block_size_u64;
 
-    if (sb.s_inodes_per_group == 0)
+    /* Basic sanity on counts we are going to use later. */
+    if (sb.s_inodes_per_group == 0 ||
+        sb.s_inodes_count     == 0)
+        return -EPROTO;
+
+    if (sb.s_inodes_per_group > (uint32_t)INT_MAX ||
+        sb.s_inodes_count     > (uint32_t)INT_MAX ||
+        sb.s_first_data_block > (uint32_t)INT_MAX)
         return -EPROTO;
 
     uint32_t inode_size = sb.s_inode_size ? sb.s_inode_size : 128u;
+
+    /* Inode size must be reasonable so that i_mode/i_links_count/i_size
+     * are fully initialised and the inode fits into a block.
+     */
+    if (inode_size < (uint32_t)sizeof(struct ext2_inode_disk) ||
+        inode_size > (uint32_t)block_size)
+        return -EPROTO;
 
     *block_size_out        = block_size;
     *inodes_per_group_out  = sb.s_inodes_per_group;
@@ -172,6 +192,9 @@ static int ext2_read_inode_size(int img,
 {
     if (inode_nr <= 0)
         return -EINVAL;
+
+    if (inodes_per_group == 0)
+        return -EPROTO;
 
     uint32_t ino  = (uint32_t)inode_nr;
     uint32_t idx0 = ino - 1;
@@ -287,12 +310,21 @@ int dump_file(int img, int inode_nr, int out)
             break;
         }
         if (r == 0) {
-            /* No more blocks.  We are done. */
+            /* No more blocks from iterator.  If the inode size claims more
+             * data than we have blocks for, treat it as I/O error.
+             */
+            if (remaining != 0)
+                err = -EIO;
             break;
         }
 
         if (remaining == 0) {
             /* More blocks than bytes to output – ignore the rest. */
+            break;
+        }
+
+        if (blkno <= 0) {
+            err = -EPROTO;
             break;
         }
 
@@ -312,6 +344,8 @@ int dump_file(int img, int inode_nr, int out)
         while (written < this_len) {
             ssize_t w = write(out, buf + written, this_len - written);
             if (w < 0) {
+                if (errno == EINTR)
+                    continue;
                 err = -errno;
                 goto out;
             }
