@@ -1,28 +1,12 @@
 #include <solution.h>
-#include <ext2blkiter.h>
 
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <limits.h>
-
-/* Forward declarations for the ext2 block iterator helpers that live in
- * ext2blkiter.c.  Only the types are opaque; we do not depend on their
- * internal layout here.
- */
-struct ext2_fs;
-struct ext2_blkiter;
-
-int  ext2_fs_init(struct ext2_fs **fs_out, int fd);
-void ext2_fs_free(struct ext2_fs *fs);
-
-int  ext2_blkiter_init(struct ext2_blkiter **it_out,
-                       struct ext2_fs *fs,
-                       int ino);
-int  ext2_blkiter_next(struct ext2_blkiter *it, int *blkno);
-/* ext2_blkiter_free() is already declared in ext2blkiter.h. */
 
 /* --------------------- On-disk EXT2 structures --------------------- */
 
@@ -134,7 +118,8 @@ static int ext2_read_basic_sb(int img,
                               uint32_t *inodes_per_group_out,
                               uint32_t *inode_size_out,
                               uint32_t *first_data_block_out,
-                              uint32_t *inodes_count_out)
+                              uint32_t *inodes_count_out,
+                              uint32_t *blocks_count_out)
 {
     struct ext2_superblock_disk sb;
     int r = read_exact_at(img, &sb, sizeof(sb), 1024);
@@ -156,7 +141,8 @@ static int ext2_read_basic_sb(int img,
 
     /* Basic sanity on counts we are going to use later. */
     if (sb.s_inodes_per_group == 0 ||
-        sb.s_inodes_count     == 0)
+        sb.s_inodes_count     == 0 ||
+        sb.s_blocks_count     == 0)
         return -EPROTO;
 
     if (sb.s_inodes_per_group > (uint32_t)INT_MAX ||
@@ -178,17 +164,18 @@ static int ext2_read_basic_sb(int img,
     *inode_size_out        = inode_size;
     *first_data_block_out  = sb.s_first_data_block;
     *inodes_count_out      = sb.s_inodes_count;
+    *blocks_count_out      = sb.s_blocks_count;
 
     return 0;
 }
 
-static int ext2_read_inode_size(int img,
-                                int inode_nr,
-                                int block_size,
-                                uint32_t inodes_per_group,
-                                uint32_t inode_size,
-                                uint32_t first_data_block,
-                                uint64_t *size_out)
+static int ext2_read_inode(int img,
+                           int inode_nr,
+                           int block_size,
+                           uint32_t inodes_per_group,
+                           uint32_t inode_size,
+                           uint32_t first_data_block,
+                           struct ext2_inode_disk *inode_out)
 {
     if (inode_nr <= 0)
         return -EINVAL;
@@ -220,18 +207,152 @@ static int ext2_read_inode_size(int img,
                       + (off_t)idx * (off_t)inode_size;
 
     struct ext2_inode_disk inode;
-    size_t to_read = inode_size < (uint32_t)sizeof(inode)
-        ? (size_t)inode_size
-        : sizeof(inode);
 
-    r = read_exact_at(img, &inode, to_read, inode_off);
+    /* The on-disk inode may be larger than the classic 128-byte struct, but
+     * we only care about the initial fields we know.  ext2_read_basic_sb()
+     * ensured inode_size >= sizeof(struct ext2_inode_disk).
+     */
+    memset(&inode, 0, sizeof(inode));
+
+    r = read_exact_at(img, &inode, sizeof(inode), inode_off);
     if (r < 0)
         return r;
 
     if (inode.i_mode == 0 || inode.i_links_count == 0)
         return -ENOENT;
 
-    *size_out = (uint64_t)inode.i_size;
+    *inode_out = inode;
+    return 0;
+}
+
+/* Map logical block index -> physical block number.
+ *
+ * Supports:
+ *   - 12 direct blocks
+ *   - single-indirect
+ *   - double-indirect
+ *
+ * Returns 0 on success, <0 on error.
+ */
+static int inode_get_block_simple(int img,
+                                  int block_size,
+                                  uint32_t block_count,
+                                  const struct ext2_inode_disk *inode,
+                                  uint32_t lblock,
+                                  uint32_t *blkno_out)
+{
+    uint32_t ptrs_per_block = (uint32_t)block_size / sizeof(uint32_t);
+    const uint32_t direct_count = 12;
+    uint32_t idx = lblock;
+
+    if (ptrs_per_block == 0)
+        return -EPROTO;
+
+    /* ---- Direct blocks ---- */
+    if (idx < direct_count) {
+        uint32_t b = inode->i_block[idx];
+        if (b == 0 || b >= block_count)
+            return -EPROTO;
+        *blkno_out = b;
+        return 0;
+    }
+
+    idx -= direct_count;
+
+    /* ---- Single-indirect ---- */
+    if (idx < ptrs_per_block) {
+        uint32_t ind_blk = inode->i_block[12];
+        uint32_t *buf = NULL;
+        int r;
+
+        if (ind_blk == 0 || ind_blk >= block_count)
+            return -EPROTO;
+
+        buf = (uint32_t *)malloc((size_t)block_size);
+        if (!buf)
+            return -ENOMEM;
+
+        r = read_exact_at(img, buf, (size_t)block_size,
+                          (off_t)ind_blk * (off_t)block_size);
+        if (r < 0) {
+            free(buf);
+            return r;
+        }
+
+        uint32_t b = buf[idx];
+        free(buf);
+
+        if (b == 0 || b >= block_count)
+            return -EPROTO;
+
+        *blkno_out = b;
+        return 0;
+    }
+
+    idx -= ptrs_per_block;
+
+    /* ---- Double-indirect ---- */
+    uint64_t per_dind = (uint64_t)ptrs_per_block * (uint64_t)ptrs_per_block;
+    if (idx >= per_dind)
+        return -EFBIG; /* would require triple-indirect, not supported */
+
+    uint32_t dind_blk = inode->i_block[13];
+    uint32_t *outer = NULL;
+    uint32_t *inner = NULL;
+    int r;
+
+    if (dind_blk == 0 || dind_blk >= block_count)
+        return -EPROTO;
+
+    outer = (uint32_t *)malloc((size_t)block_size);
+    if (!outer)
+        return -ENOMEM;
+
+    r = read_exact_at(img, outer, (size_t)block_size,
+                      (off_t)dind_blk * (off_t)block_size);
+    if (r < 0) {
+        free(outer);
+        return r;
+    }
+
+    uint32_t outer_index = idx / ptrs_per_block;
+    uint32_t inner_index = idx % ptrs_per_block;
+
+    if (outer_index >= ptrs_per_block) {
+        free(outer);
+        return -EPROTO;
+    }
+
+    uint32_t ind_blk = outer[outer_index];
+
+    if (ind_blk == 0 || ind_blk >= block_count) {
+        free(outer);
+        return -EPROTO;
+    }
+
+    inner = (uint32_t *)malloc((size_t)block_size);
+    if (!inner) {
+        free(outer);
+        return -ENOMEM;
+    }
+
+    r = read_exact_at(img, inner, (size_t)block_size,
+                      (off_t)ind_blk * (off_t)block_size);
+    if (r < 0) {
+        free(inner);
+        free(outer);
+        return r;
+    }
+
+    uint32_t b = inner[inner_index];
+
+    free(inner);
+    free(outer);
+
+    if (b == 0 || b >= block_count)
+        return -EPROTO;
+
+    *blkno_out = b;
     return 0;
 }
 
@@ -247,84 +368,69 @@ int dump_file(int img, int inode_nr, int out)
     uint32_t inode_size = 0;
     uint32_t first_data_block = 0;
     uint32_t inodes_count = 0;
+    uint32_t blocks_count = 0;
 
     int r = ext2_read_basic_sb(img,
                                &block_size,
                                &inodes_per_group,
                                &inode_size,
                                &first_data_block,
-                               &inodes_count);
+                               &inodes_count,
+                               &blocks_count);
     if (r < 0)
         return r;
 
     if ((uint32_t)inode_nr > inodes_count)
         return -EINVAL;
 
-    uint64_t file_size = 0;
-    r = ext2_read_inode_size(img,
-                             inode_nr,
-                             block_size,
-                             inodes_per_group,
-                             inode_size,
-                             first_data_block,
-                             &file_size);
+    struct ext2_inode_disk inode;
+    r = ext2_read_inode(img,
+                        inode_nr,
+                        block_size,
+                        inodes_per_group,
+                        inode_size,
+                        first_data_block,
+                        &inode);
     if (r < 0)
         return r;
 
-    /* Use the ext2 block iterator helpers working on a *duplicate* of the
-     * image fd, so that we do not interfere with the caller's descriptor.
-     */
-    int dupfd = dup(img);
-    if (dupfd < 0)
-        return -errno;
+    uint64_t file_size = (uint64_t)inode.i_size;
+    uint64_t remaining = file_size;
 
-    struct ext2_fs *fs = NULL;
-    r = ext2_fs_init(&fs, dupfd);
-    if (r < 0) {
-        close(dupfd);
-        return r;
-    }
-
-    struct ext2_blkiter *it = NULL;
-    r = ext2_blkiter_init(&it, fs, inode_nr);
-    if (r < 0) {
-        ext2_fs_free(fs);
-        return r;
-    }
+    if (remaining == 0)
+        return 0;
 
     char *buf = (char *)malloc((size_t)block_size);
-    if (!buf) {
-        ext2_blkiter_free(it);
-        ext2_fs_free(fs);
+    if (!buf)
         return -ENOMEM;
+
+    uint32_t ptrs_per_block = (uint32_t)block_size / sizeof(uint32_t);
+    const uint64_t direct_count = 12;
+    uint64_t max_blocks = direct_count
+                        + (uint64_t)ptrs_per_block
+                        + (uint64_t)ptrs_per_block * (uint64_t)ptrs_per_block;
+    uint64_t needed_blocks =
+        (file_size + (uint64_t)block_size - 1u) / (uint64_t)block_size;
+
+    if (ptrs_per_block == 0 || needed_blocks > max_blocks) {
+        free(buf);
+        return -EFBIG; /* would require triple-indirect or larger */
     }
 
-    uint64_t remaining = file_size;
     int err = 0;
+    uint32_t lblock = 0;
 
-    while (1) {
-        int blkno = 0;
-        r = ext2_blkiter_next(it, &blkno);
+    while (remaining > 0) {
+        uint32_t blkno = 0;
+
+        r = inode_get_block_simple(img,
+                                   block_size,
+                                   blocks_count,
+                                   &inode,
+                                   lblock,
+                                   &blkno);
         if (r < 0) {
             err = r;
-            break;
-        }
-        if (r == 0) {
-            /* No more blocks from iterator.  If the inode size claims more
-             * data than we have blocks for, treat it as I/O error.
-             */
-            if (remaining != 0)
-                err = -EIO;
-            break;
-        }
-
-        if (remaining == 0) {
-            /* More blocks than bytes to output – ignore the rest. */
-            break;
-        }
-
-        if (blkno <= 0) {
-            err = -EPROTO;
             break;
         }
 
@@ -357,11 +463,10 @@ int dump_file(int img, int inode_nr, int out)
         }
 
         remaining -= this_len;
+        lblock++;
     }
 
 out:
     free(buf);
-    ext2_blkiter_free(it);
-    ext2_fs_free(fs);
     return err;
 }
