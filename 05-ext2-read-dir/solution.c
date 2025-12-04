@@ -102,22 +102,19 @@ struct ext2_dir_entry_disk
 
 static int read_exact_at(int fd, void *buf, size_t count, off_t offset)
 {
-    if (lseek(fd, offset, SEEK_SET) < 0)
-        return -errno;
-
     uint8_t *p = (uint8_t *)buf;
     size_t remaining = count;
 
     while (remaining > 0) {
-        ssize_t r = read(fd, p, remaining);
+        ssize_t r = pread(fd, p, remaining, offset);
         if (r < 0)
             return -errno;
         if (r == 0)
-            return -EIO; /* unexpected EOF */
+            return -EPROTO; /* unexpected EOF */
         p += (size_t)r;
         remaining -= (size_t)r;
+        offset += (off_t)r;
     }
-
     return 0;
 }
 
