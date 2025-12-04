@@ -47,7 +47,8 @@ struct ext2_superblock_disk
     char     s_volume_name[16];
     char     s_last_mounted[64];
     uint32_t s_algorithm_usage_bitmap;
-    /* the rest is not needed here */
+
+    /* The rest of the original ext2 superblock is not needed here. */
 } __attribute__((packed));
 
 struct ext2_group_desc_disk
@@ -81,10 +82,9 @@ struct ext2_inode_disk
     uint32_t i_file_acl;
     uint32_t i_dir_acl;
     uint32_t i_faddr;
-    uint32_t i_osd2[3];
+    uint8_t  i_osd2[12];
 } __attribute__((packed));
 
-/* Directory entry with file_type field (EXT2 feature). */
 struct ext2_dir_entry_disk
 {
     uint32_t inode;
@@ -149,6 +149,10 @@ static int ext2_read_basic_sb(int img,
         return -EPROTO;
 
     uint32_t inode_size = sb.s_inode_size ? sb.s_inode_size : 128u;
+    /* Basic sanity check: the on-disk inode size must be large enough
+       to cover the mandatory 128-byte inode structure used by ext2. */
+    if (inode_size < 128u)
+        return -EPROTO;
 
     *block_size_out        = block_size;
     *first_data_block_out  = sb.s_first_data_block;
@@ -160,7 +164,7 @@ static int ext2_read_basic_sb(int img,
     return 0;
 }
 
-/* Read a single inode from disk. */
+/* Read inode inode_nr into *inode_out. */
 static int ext2_read_inode(int img,
                            int block_size,
                            uint32_t first_data_block,
@@ -209,8 +213,7 @@ static int ext2_read_inode(int img,
     return 0;
 }
 
-/* Map a logical block index to a physical block number using the inode's
-   direct/indirect block pointers. */
+/* Map a logical block number to a physical block number using i_block[]. */
 static int inode_get_block(int img,
                            int block_size,
                            uint32_t block_count,
@@ -237,41 +240,47 @@ static int inode_get_block(int img,
     idx -= direct_count;
 
     /* ---- Single-indirect ---- */
-    if (idx < ptrs_per_block) {
-        uint32_t ind_blk = inode->i_block[12];
-        uint32_t *buf;
-        int r;
+    {
+        uint32_t per_sind = ptrs_per_block;
+        if (idx < per_sind) {
+            uint32_t ind_blk = inode->i_block[12];
+            uint32_t *buf;
+            int r;
 
-        if (ind_blk == 0 || ind_blk >= block_count)
-            return -EPROTO;
+            if (ind_blk == 0 || ind_blk >= block_count)
+                return -EPROTO;
 
-        buf = (uint32_t *)malloc((size_t)block_size);
-        if (!buf)
-            return -ENOMEM;
+            buf = (uint32_t *)malloc((size_t)block_size);
+            if (!buf)
+                return -ENOMEM;
 
-        r = read_exact_at(img, buf, (size_t)block_size,
-                          (off_t)ind_blk * (off_t)block_size);
-        if (r < 0) {
+            r = read_exact_at(img, buf, (size_t)block_size,
+                              (off_t)ind_blk * (off_t)block_size);
+            if (r < 0) {
+                free(buf);
+                return r;
+            }
+
+            uint32_t b = buf[idx];
             free(buf);
-            return r;
+
+            if (b == 0 || b >= block_count)
+                return -EPROTO;
+
+            *blkno = b;
+            return 0;
         }
 
-        uint32_t b = buf[idx];
-        free(buf);
-
-        if (b == 0 || b >= block_count)
-            return -EPROTO;
-
-        *blkno = b;
-        return 0;
+        idx -= per_sind;
     }
-
-    idx -= ptrs_per_block;
 
     /* ---- Double-indirect ---- */
     {
-        uint64_t per_dind = (uint64_t)ptrs_per_block * ptrs_per_block;
-        if (idx < per_dind) {
+        uint64_t per_dind = (uint64_t)ptrs_per_block * (uint64_t)ptrs_per_block;
+        if (per_dind == 0 || per_dind > UINT32_MAX)
+            return -EPROTO;
+
+        if (idx < (uint32_t)per_dind) {
             uint32_t dind_blk = inode->i_block[13];
             uint32_t *outer = NULL;
             uint32_t *inner = NULL;
@@ -331,7 +340,10 @@ static int inode_get_block(int img,
         /* ---- Triple-indirect ---- */
         {
             uint64_t per_tind = per_dind * ptrs_per_block;
-            if (idx < per_tind) {
+            if (per_tind == 0)
+                return -EPROTO;
+
+            if (idx < (uint32_t)per_tind) {
                 uint32_t tind_blk = inode->i_block[14];
                 uint32_t *lvl1 = NULL;
                 uint32_t *lvl2 = NULL;
@@ -352,11 +364,18 @@ static int inode_get_block(int img,
                     return r;
                 }
 
-                uint64_t idx1 = idx / per_dind;
-                uint64_t rem  = idx % per_dind;
+                uint64_t per_lvl2 = (uint64_t)ptrs_per_block * (uint64_t)ptrs_per_block;
+                if (per_lvl2 == 0) {
+                    free(lvl1);
+                    return -EPROTO;
+                }
 
-                uint32_t blk_lvl2 = lvl1[idx1];
+                uint32_t idx_lvl1 = idx / (uint32_t)per_lvl2;
+                uint32_t rem      = idx % (uint32_t)per_lvl2;
+                uint32_t idx_lvl2 = rem / ptrs_per_block;
+                uint32_t idx_lvl3 = rem % ptrs_per_block;
 
+                uint32_t blk_lvl2 = lvl1[idx_lvl1];
                 if (blk_lvl2 == 0 || blk_lvl2 >= block_count) {
                     free(lvl1);
                     return -EPROTO;
@@ -376,13 +395,7 @@ static int inode_get_block(int img,
                     return r;
                 }
 
-                uint32_t outer_index =
-                    (uint32_t)(rem / ptrs_per_block);
-                uint32_t inner_index =
-                    (uint32_t)(rem % ptrs_per_block);
-
-                uint32_t blk_lvl3 = lvl2[outer_index];
-
+                uint32_t blk_lvl3 = lvl2[idx_lvl2];
                 if (blk_lvl3 == 0 || blk_lvl3 >= block_count) {
                     free(lvl2);
                     free(lvl1);
@@ -405,7 +418,7 @@ static int inode_get_block(int img,
                     return r;
                 }
 
-                uint32_t b = lvl3[inner_index];
+                uint32_t b = lvl3[idx_lvl3];
 
                 free(lvl3);
                 free(lvl2);
@@ -424,7 +437,7 @@ static int inode_get_block(int img,
     return -EPROTO;
 }
 
-/* ----------------------------- Public API ----------------------------- */
+/* ----------------------------- dump_dir ----------------------------- */
 
 int dump_dir(int img, int inode_nr)
 {
@@ -447,9 +460,6 @@ int dump_dir(int img, int inode_nr)
                                &blocks_count);
     if (r < 0)
         return r;
-
-    if ((uint32_t)inode_nr > inodes_count)
-        return -EINVAL;
 
     struct ext2_inode_disk inode;
     r = ext2_read_inode(img,
@@ -537,6 +547,13 @@ int dump_dir(int img, int inode_nr)
 
             if (name_len > 0 && inode_child != 0) {
                 if (name_len > rec_len - 8) {
+                    err = -EPROTO;
+                    goto out;
+                }
+
+                /* Guard against inode numbers that do not fit into the
+                   report_file() interface. */
+                if (inode_child > (uint32_t)INT_MAX) {
                     err = -EPROTO;
                     goto out;
                 }
